@@ -34,7 +34,7 @@ cuda_num = args.cuda
 tem = 0.02
 bs = 128
 seed = 5009
-seed_round = 5
+seed_round = 1
 
 if dataset == 'nsl':
     input_dim = 121
