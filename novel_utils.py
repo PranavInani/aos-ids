@@ -1,117 +1,143 @@
 """
 Novel utilities for AOC-IDS with:
-1. GMM-based decision boundary (replaces rigid 2-Gaussian MLE)
-2. Confidence score output for pseudo-label filtering
+1. Confidence-aware evaluate (extends original 2-Gaussian with confidence scores)
+2. Original evaluate preserved for proven accuracy
 """
 from utils import *
-from sklearn.mixture import GaussianMixture
 import torch
 import torch.nn.functional as F
+import torch.distributions as dist
 import numpy as np
+import scipy.optimize as opt
 
 
-def evaluate_gmm(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model,
-                 max_components=5, get_confidence=False):
+def evaluate_with_confidence(normal_temp, normal_recon_temp, x_train, y_train,
+                             x_test, y_test, model):
     """
-    GMM-based evaluation replacing the rigid 2-Gaussian assumption.
-    Uses BIC to auto-select optimal number of components.
+    Same proven 2-Gaussian decision boundary as the original evaluate(),
+    but ALSO returns per-sample confidence scores for pseudo-label filtering.
+
+    Confidence = max(|pdf_normal - pdf_abnormal|) across encoder and decoder branches.
+
+    Returns:
+        If y_test is int (online mode): (predictions, confidence_scores)
+        Otherwise (eval mode):          (result_encoder, result_decoder, result_final, confidence_scores)
     """
     num_of_layer = 0
-    num_of_output = 1
 
     x_train_normal = x_train[(y_train == 0).squeeze()]
     x_train_abnormal = x_train[(y_train == 1).squeeze()]
 
-    # --- Encoder branch ---
+    # ── Encoder branch ──
     train_features = F.normalize(model(x_train)[num_of_layer], p=2, dim=1)
     train_features_normal = F.normalize(model(x_train_normal)[num_of_layer], p=2, dim=1)
+    train_features_abnormal = F.normalize(model(x_train_abnormal)[num_of_layer], p=2, dim=1)
     test_features = F.normalize(model(x_test)[num_of_layer], p=2, dim=1)
 
-    sim_all_en = F.cosine_similarity(train_features, normal_temp.unsqueeze(0), dim=1).cpu().detach().numpy().reshape(-1, 1)
-    sim_test_en = F.cosine_similarity(test_features, normal_temp.unsqueeze(0), dim=1).cpu().detach().numpy().reshape(-1, 1)
+    values_features_all, _ = torch.sort(F.cosine_similarity(
+        train_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
+    values_features_normal, _ = torch.sort(F.cosine_similarity(
+        train_features_normal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
+    values_features_abnormal, _ = torch.sort(F.cosine_similarity(
+        train_features_abnormal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
 
-    y_train_np = y_train.cpu().detach().numpy() if torch.is_tensor(y_train) else np.array(y_train)
+    values_features_all_np = values_features_all.cpu().detach().numpy()
+    values_features_test = F.cosine_similarity(
+        test_features, normal_temp.reshape([-1, normal_temp.shape[0]]))
 
-    gmm_en = _fit_best_gmm(sim_all_en, max_components)
-    pred_en, conf_en = _classify_with_gmm(gmm_en, sim_all_en, y_train_np, sim_test_en)
+    # Fit encoder Gaussians
+    mu1_initial = np.mean(values_features_normal.cpu().detach().numpy())
+    sigma1_initial = np.std(values_features_normal.cpu().detach().numpy())
+    mu2_initial = np.mean(values_features_abnormal.cpu().detach().numpy())
+    sigma2_initial = np.std(values_features_abnormal.cpu().detach().numpy())
 
-    # --- Decoder branch ---
+    initial_params = np.array([mu1_initial, sigma1_initial, mu2_initial, sigma2_initial])
+    result = opt.minimize(log_likelihood, initial_params,
+                          args=(values_features_all_np,), method='Nelder-Mead')
+    mu1_fit, sigma1_fit, mu2_fit, sigma2_fit = [float(v) for v in result.x]
+    sigma1_fit, sigma2_fit = abs(sigma1_fit), abs(sigma2_fit)
+
+    if mu1_fit > mu2_fit:
+        gaussian1 = dist.Normal(mu1_fit, sigma1_fit)
+        gaussian2 = dist.Normal(mu2_fit, sigma2_fit)
+    else:
+        gaussian2 = dist.Normal(mu1_fit, sigma1_fit)
+        gaussian1 = dist.Normal(mu2_fit, sigma2_fit)
+
+    pdf1 = gaussian1.log_prob(values_features_test).exp()
+    pdf2 = gaussian2.log_prob(values_features_test).exp()
+    y_test_pred_2 = (pdf2 > pdf1).cpu().numpy().astype("int32")
+    y_test_pro_en = (torch.abs(pdf2 - pdf1)).cpu().detach().numpy().astype("float32")
+
+    if isinstance(y_test, int) == False:
+        if y_test.device != torch.device("cpu"):
+            y_test = y_test.cpu().numpy()
+
+    # ── Decoder branch ──
+    num_of_output = 1
     train_recon = F.normalize(model(x_train)[num_of_output], p=2, dim=1)
+    train_recon_normal = F.normalize(model(x_train_normal)[num_of_output], p=2, dim=1)
+    train_recon_abnormal = F.normalize(model(x_train_abnormal)[num_of_output], p=2, dim=1)
     test_recon = F.normalize(model(x_test)[num_of_output], p=2, dim=1)
 
-    sim_all_de = F.cosine_similarity(train_recon, normal_recon_temp.unsqueeze(0), dim=1).cpu().detach().numpy().reshape(-1, 1)
-    sim_test_de = F.cosine_similarity(test_recon, normal_recon_temp.unsqueeze(0), dim=1).cpu().detach().numpy().reshape(-1, 1)
+    values_recon_all, _ = torch.sort(F.cosine_similarity(
+        train_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
+    values_recon_normal, _ = torch.sort(F.cosine_similarity(
+        train_recon_normal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
+    values_recon_abnormal, _ = torch.sort(F.cosine_similarity(
+        train_recon_abnormal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
 
-    gmm_de = _fit_best_gmm(sim_all_de, max_components)
-    pred_de, conf_de = _classify_with_gmm(gmm_de, sim_all_de, y_train_np, sim_test_de)
+    values_recon_all_np = values_recon_all.cpu().detach().numpy()
+    values_recon_test = F.cosine_similarity(
+        test_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1)
 
-    # --- Vote: pick whichever branch is more confident ---
-    pred_final = np.where(conf_en > conf_de, pred_en, pred_de).astype("int32")
-    conf_final = np.maximum(conf_en, conf_de).astype("float32")
+    # Fit decoder Gaussians
+    mu3_initial = np.mean(values_recon_normal.cpu().detach().numpy())
+    sigma3_initial = np.std(values_recon_normal.cpu().detach().numpy())
+    mu4_initial = np.mean(values_recon_abnormal.cpu().detach().numpy())
+    sigma4_initial = np.std(values_recon_abnormal.cpu().detach().numpy())
+
+    initial_params = np.array([mu3_initial, sigma3_initial, mu4_initial, sigma4_initial])
+    result = opt.minimize(log_likelihood, initial_params,
+                          args=(values_recon_all_np,), method='Nelder-Mead')
+    mu3_fit, sigma3_fit, mu4_fit, sigma4_fit = [float(v) for v in result.x]
+    sigma3_fit, sigma4_fit = abs(sigma3_fit), abs(sigma4_fit)
+
+    if mu3_fit > mu4_fit:
+        gaussian3 = dist.Normal(mu3_fit, sigma3_fit)
+        gaussian4 = dist.Normal(mu4_fit, sigma4_fit)
+    else:
+        gaussian4 = dist.Normal(mu3_fit, sigma3_fit)
+        gaussian3 = dist.Normal(mu4_fit, sigma4_fit)
+
+    pdf3 = gaussian3.log_prob(values_recon_test).exp()
+    pdf4 = gaussian4.log_prob(values_recon_test).exp()
+    y_test_pred_4 = (pdf4 > pdf3).cpu().numpy().astype("int32")
+    y_test_pro_de = (torch.abs(pdf4 - pdf3)).cpu().detach().numpy().astype("float32")
 
     if not isinstance(y_test, int):
-        y_test_np = y_test.cpu().numpy() if torch.is_tensor(y_test) and y_test.device != torch.device("cpu") else (y_test.numpy() if torch.is_tensor(y_test) else y_test)
-        result_encoder = score_detail(y_test_np, pred_en)
-        result_decoder = score_detail(y_test_np, pred_de)
-        result_final = score_detail(y_test_np, pred_final, if_print=True)
-        if get_confidence:
-            return result_encoder, result_decoder, result_final, conf_final
-        return result_encoder, result_decoder, result_final
+        if y_test.device != torch.device("cpu"):
+            y_test = y_test.cpu().numpy()
+        result_encoder = score_detail(y_test, y_test_pred_2)
+        result_decoder = score_detail(y_test, y_test_pred_4)
+
+    # ── Vote + confidence ──
+    y_test_pred_no_vote = torch.where(
+        torch.from_numpy(y_test_pro_en) > torch.from_numpy(y_test_pro_de),
+        torch.from_numpy(y_test_pred_2),
+        torch.from_numpy(y_test_pred_4))
+
+    # Confidence: the winning branch's |pdf_abnormal - pdf_normal|, normalized
+    confidence_raw = np.maximum(y_test_pro_en, y_test_pro_de)
+    # Normalize to [0, 1] using percentile-based scaling for stability
+    p95 = np.percentile(confidence_raw, 95) if len(confidence_raw) > 0 else 1.0
+    if p95 > 0:
+        confidence = np.clip(confidence_raw / p95, 0.0, 1.0).astype("float32")
     else:
-        if get_confidence:
-            return pred_final, conf_final
-        return pred_final
+        confidence = np.ones_like(confidence_raw, dtype="float32")
 
-
-def _fit_best_gmm(data, max_components=5):
-    """Fit GMM with BIC-based component selection."""
-    n_samples = len(data)
-    max_k = min(max_components, max(n_samples // 10, 2))
-    max_k = max(max_k, 2)
-
-    best_bic, best_gmm = np.inf, None
-    for k in range(2, max_k + 1):
-        try:
-            gmm = GaussianMixture(n_components=k, covariance_type='full',
-                                  random_state=42, max_iter=200)
-            gmm.fit(data)
-            bic = gmm.bic(data)
-            if bic < best_bic:
-                best_bic, best_gmm = bic, gmm
-        except Exception:
-            continue
-
-    if best_gmm is None:
-        best_gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42)
-        best_gmm.fit(data)
-    return best_gmm
-
-
-def _classify_with_gmm(gmm, train_data, train_labels, test_data):
-    """
-    Classify test data using fitted GMM.
-    Identifies which components are normal vs abnormal using training labels.
-    Returns (predictions, confidence_scores).
-    """
-    train_assignments = gmm.predict(train_data)
-    n_components = gmm.n_components
-
-    # Determine which components are "normal" based on training label majority
-    normal_components = []
-    for k in range(n_components):
-        mask = train_assignments == k
-        if mask.sum() > 0 and (train_labels[mask] == 0).mean() > 0.5:
-            normal_components.append(k)
-
-    # Fallback: if no component is normal, pick the one with highest mean (most similar to normal template)
-    if len(normal_components) == 0:
-        normal_components = [np.argmax(gmm.means_.flatten())]
-
-    test_proba = gmm.predict_proba(test_data)
-    p_normal = np.sum(test_proba[:, normal_components], axis=1)
-    p_abnormal = 1.0 - p_normal
-
-    predictions = (p_abnormal > p_normal).astype("int32")
-    confidence = np.abs(p_normal - p_abnormal).astype("float32")
-
-    return predictions, confidence
+    if not isinstance(y_test, int):
+        result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
+        return result_encoder, result_decoder, result_final, confidence
+    else:
+        return y_test_pred_no_vote, confidence
