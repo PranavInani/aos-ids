@@ -1,5 +1,8 @@
 import torch
 import numpy as np
+import sys
+import os
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,6 +33,25 @@ percent = args.percent
 flip_percent = args.flip_percent
 sample_interval = args.sample_interval
 cuda_num = args.cuda
+
+# ---- Tee stdout to log file ----
+class Tee:
+    def __init__(self, filepath, mode='w'):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self.file = open(filepath, mode)
+        self.stdout = sys.stdout
+    def write(self, data):
+        self.stdout.write(data)
+        self.file.write(data)
+        self.file.flush()
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+log_path = f'logs/online_training_{dataset}_{timestamp}.log'
+sys.stdout = Tee(log_path)
+print(f'Logging to {log_path}')
 
 tem = 0.02
 bs = 128

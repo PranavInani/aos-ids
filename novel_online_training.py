@@ -14,6 +14,9 @@ from novel_utils import *
 import argparse
 import warnings
 import math
+import sys
+import os
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
@@ -53,6 +56,25 @@ max_gmm_components = args.max_gmm_components
 initial_temp = args.initial_temp
 min_temp = args.min_temp
 online_temp = args.online_temp
+
+# ---- Tee stdout to log file ----
+class Tee:
+    def __init__(self, filepath, mode='w'):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self.file = open(filepath, mode)
+        self.stdout = sys.stdout
+    def write(self, data):
+        self.stdout.write(data)
+        self.file.write(data)
+        self.file.flush()
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+log_path = f'logs/novel_online_training_{dataset}_{timestamp}.log'
+sys.stdout = Tee(log_path)
+print(f'Logging to {log_path}')
 
 bs = 128
 seed = 5009
