@@ -1,4 +1,4 @@
 \beamer@sectionintoc {1}{Background \& Motivation}{3}{0}{1}
 \beamer@sectionintoc {2}{AOC-IDS Framework}{4}{0}{2}
-\beamer@sectionintoc {3}{Our Novel Contributions}{9}{0}{3}
-\beamer@sectionintoc {4}{Summary}{12}{0}{4}
+\beamer@sectionintoc {3}{Our Novel Contributions}{10}{0}{3}
+\beamer@sectionintoc {4}{Summary}{14}{0}{4}

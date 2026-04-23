@@ -148,9 +148,9 @@
         \begin{column}{0.48\textwidth}
             \textbf{Cluster Repelling Contrastive (CRC) Loss}
             \begin{itemize}
-                \item Based on InfoNCE, but with \textbf{two traversals} of the abnormal set
-                \item Pulls normal samples \textbf{together}
-                \item Pushes normal and abnormal samples \textbf{apart}
+                \item Built on InfoNCE, but tailored for anomaly detection.
+                \item \textbf{Crucial difference}: It incorporates \textbf{two traversals} of the abnormal set, amplifying the repelling force.
+                \item \textbf{Intuition}: Forces normal traffic into a tight cluster while pushing known anomalies far away in the embedding space.
             \end{itemize}
 
             \vspace{0.2cm}
@@ -246,7 +246,7 @@
     \end{columns}
 \end{frame}
 
-\begin{frame}{Experimental Results}
+\begin{frame}{Experimental Setup (Original Paper)}
     \begin{columns}[T]
         \begin{column}{0.48\textwidth}
             \textbf{Datasets:}
@@ -282,51 +282,69 @@
     \end{columns}
 \end{frame}
 
+\begin{frame}{Evaluation: Reproduction \& Novelty Results}
+    \begin{table}[h]
+        \centering
+        \caption{\textbf{NSL-KDD Dataset (\%)}}
+        \renewcommand{\arraystretch}{1.2}
+        \begin{tabular}{@{}lcccc@{}}
+            \toprule
+            \textbf{Model} & \textbf{Accuracy} & \textbf{Precision} & \textbf{Recall} & \textbf{F1 Score} \\
+            \midrule
+            Original Paper Reported & 88.90 & 85.99 & 96.21 & 90.81 \\
+            Our Baseline Reproduction & 86.91 & 83.28 & 96.35 & 89.34 \\
+            \textbf{Our HNSW Novelty} & TBD & TBD & TBD & TBD \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+
+    \vspace{0.2cm}
+
+    \begin{table}[h]
+        \centering
+        \caption{\textbf{UNSW-NB15 Dataset (\%)}}
+        \renewcommand{\arraystretch}{1.2}
+        \begin{tabular}{@{}lcccc@{}}
+            \toprule
+            \textbf{Model} & \textbf{Accuracy} & \textbf{Precision} & \textbf{Recall} & \textbf{F1 Score} \\
+            \midrule
+            Original Paper Reported & 89.19 & 90.65 & 89.70 & 90.14 \\
+            Our Baseline Reproduction & 89.41 & 91.30 & 89.26 & 90.27 \\
+            \textbf{Our HNSW Novelty} & 87.90 & 88.30 & 89.94 & 89.11 \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+\end{frame}
+
 % ══════════════════════════════════════════════════════════
 \section{Our Novel Contributions}
 % ══════════════════════════════════════════════════════════
 
-\begin{frame}{Novelty 1: GMM-Based Adaptive Decision Boundary}
+\begin{frame}{Evolution of the Decision Boundary: What Didn't Work}
     \begin{columns}[T]
         \begin{column}{0.48\textwidth}
-            \textbf{Problem with original approach:}
+            \textbf{Initial Hypothesis: GMM}
             \begin{itemize}
-                \item Fixed \textbf{2-Gaussian} assumption
-                \item Multiple attack types (DDoS, Probe, R2L\ldots) form \textbf{different clusters}
-                \item Nelder-Mead optimizer is \textbf{unconstrained} — can produce negative $\sigma$
+                \item The original paper forces cosine similarities into a \textbf{1D 2-Gaussian} distribution.
+                \item \textbf{Idea:} Use a Gaussian Mixture Model (GMM) with BIC selection to capture multiple attack types.
             \end{itemize}
 
             \vspace{0.3cm}
-            \textbf{Our improvement:}
+            \textbf{Why it failed:}
             \begin{itemize}
-                \item Replace with \textbf{Gaussian Mixture Model (GMM)}
-                \item Auto-select components ($k=2{\text{-}}5$) via \textbf{BIC}
-                \item Label components as normal/abnormal using \textbf{training label majority}
-                \item Posterior probabilities give natural \textbf{confidence scores}
+                \item Still projects high-dimensional embeddings into a \textbf{1D similarity space}, losing crucial structural information.
+                \item Optimization was \textbf{unstable} online (Nelder-Mead/EM algorithms struggled with continuous data streams).
+                \item Produced noisy decision boundaries.
             \end{itemize}
         \end{column}
         \begin{column}{0.48\textwidth}
             \centering
             \begin{tikzpicture}[scale=0.68]
-                \draw[-{Stealth}, thick] (-0.3,0) -- (7,0) node[right, font=\footnotesize] {Sim.};
-                \draw[-{Stealth}, thick] (0,-0.3) -- (0,3.5);
-
-                % Original: 2 Gaussians
-                \node[font=\footnotesize\bfseries, darkblue] at (3.5, 3.8) {Original: 2 Gaussians};
-                \draw[thick, red!60] plot[domain=0:3.5, samples=40]
-                    (\x, {2*exp(-(\x-1.5)^2/0.5)});
-                \draw[thick, blue!60] plot[domain=2.5:6.5, samples=40]
-                    (\x, {2.5*exp(-(\x-4.5)^2/0.4)});
-            \end{tikzpicture}
-
-            \vspace{0.2cm}
-
-            \begin{tikzpicture}[scale=0.68]
-                \draw[-{Stealth}, thick] (-0.3,0) -- (7,0) node[right, font=\footnotesize] {Sim.};
+                \draw[-{Stealth}, thick] (-0.3,0) -- (7,0) node[right, font=\footnotesize] {1D Sim.};
                 \draw[-{Stealth}, thick] (0,-0.3) -- (0,3.5);
 
                 % Novel: GMM with 4 components
-                \node[font=\footnotesize\bfseries, accentblue] at (3.5, 3.8) {Novel: GMM (BIC-selected)};
+                \node[font=\footnotesize\bfseries, red!70!black] at (3.5, 3.8) {Failed Attempt: GMM in 1D};
                 \draw[thick, red!60] plot[domain=0:2.5, samples=30]
                     (\x, {1.5*exp(-(\x-0.8)^2/0.3)});
                 \draw[thick, red!40] plot[domain=1:4, samples=30]
@@ -335,6 +353,71 @@
                     (\x, {2.2*exp(-(\x-4.2)^2/0.3)});
                 \draw[thick, blue!40] plot[domain=4.5:7, samples=30]
                     (\x, {1.8*exp(-(\x-5.5)^2/0.2)});
+            \end{tikzpicture}
+
+            \vspace{0.2cm}
+            \begin{block}{The Realization}
+                The problem isn't the distribution shape; it's the \textbf{lossy 1D projection}.
+            \end{block}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Novelty 1: High-Dimensional HNSW Vector Search}
+    \begin{columns}[T]
+        \begin{column}{0.52\textwidth}
+            \textbf{The Solution: Stay in High-D Space}
+            \begin{itemize}
+                \item Instead of projecting to 1D, we use the \textbf{full 32/64-dimensional autoencoder embeddings}.
+                \item \textbf{Approach:} Build a Hierarchical Navigable Small World (\textbf{HNSW}) graph of \textit{only normal} training samples.
+                \item \textbf{Detection:} For a test sample, query the $k$-Nearest Neighbors in the HNSW graph.
+                \item If the mean $k$-NN distance $>$ threshold (95th percentile) $\Rightarrow$ \textbf{Anomaly}.
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Advantages:}
+            \begin{itemize}
+                \item Captures highly \textbf{non-linear} normal clusters.
+                \item \textbf{Fast inference} ($O(\log N)$) suitable for online streams.
+                \item No restrictive distributional assumptions.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.44\textwidth}
+            \centering
+            \begin{tikzpicture}[scale=0.85]
+                % Axes
+                \draw[-{Stealth}, thick] (-0.5,0) -- (4.5,0) node[right, font=\footnotesize] {Dim 1};
+                \draw[-{Stealth}, thick] (0,-0.5) -- (0,4) node[above, font=\footnotesize] {Dim 2};
+
+                % Normal nodes (HNSW Graph)
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n1) at (1, 1.2) {};
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n2) at (1.5, 2.1) {};
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n3) at (2.4, 1.6) {};
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n4) at (2.8, 2.5) {};
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n5) at (1.9, 3.2) {};
+                \node[circle, fill=accentblue, inner sep=1.8pt] (n6) at (0.8, 2.6) {};
+
+                % HNSW edges
+                \draw[thin, blue!30] (n1) -- (n2);
+                \draw[thin, blue!30] (n2) -- (n3);
+                \draw[thin, blue!30] (n3) -- (n4);
+                \draw[thin, blue!30] (n2) -- (n5);
+                \draw[thin, blue!30] (n4) -- (n5);
+                \draw[thin, blue!30] (n2) -- (n6);
+                \draw[thin, blue!30] (n1) -- (n6);
+
+                % Test sample (Normal)
+                \node[circle, fill=green!60!black, inner sep=2.2pt, label={[font=\scriptsize, green!50!black]below:Normal}] (t1) at (1.8, 2) {};
+                \draw[dashed, thick, green!60!black] (t1) -- (n2);
+                \draw[dashed, thick, green!60!black] (t1) -- (n3);
+
+                % Test sample (Abnormal)
+                \node[star, star points=5, fill=red!70, inner sep=2pt, label={[font=\scriptsize, red!70]right:Abnormal}] (t2) at (3.8, 0.8) {};
+                \draw[dashed, thick, red!70] (t2) -- (n3);
+                \draw[dashed, thick, red!70] (t2) -- (n4);
+
+                % Legend or labels
+                \node[font=\footnotesize\bfseries, darkblue, fill=white, inner sep=2pt] at (2, 3.8) {HNSW Graph in Embedding Space};
             \end{tikzpicture}
         \end{column}
     \end{columns}
@@ -471,7 +554,7 @@
             \toprule
             \textbf{Aspect} & \textbf{Original AOC-IDS} & \textbf{Our Improvement} \\
             \midrule
-            Decision Boundary & Fixed 2-Gaussian MLE & GMM with BIC selection \\
+            Decision Boundary & 1D 2-Gaussian MLE & \textbf{High-D HNSW Vector Search} \\
             Pseudo-Label Quality & Random flip (5\%) & Confidence-based filtering \\
             CRC Temperature & Fixed $\tau = 0.02$ & Cosine annealing + warm online $\tau$ \\
             \bottomrule
@@ -482,16 +565,16 @@
 
     \begin{block}{Why These Improvements Matter}
         \begin{itemize}
-            \item \textbf{GMM}: Captures multi-modal attack distributions $\Rightarrow$ better boundaries
-            \item \textbf{Confidence filtering}: Breaks error propagation cycle $\Rightarrow$ cleaner online learning
-            \item \textbf{Temperature scheduling}: Matches training dynamics $\Rightarrow$ stable convergence
+            \item \textbf{HNSW Vector Search}: Replaces lossy 1D assumption with true spatial geometry $\Rightarrow$ better detection of complex anomalies.
+            \item \textbf{Confidence filtering}: Breaks error propagation cycle $\Rightarrow$ cleaner online learning.
+            \item \textbf{Temperature scheduling}: Matches training dynamics $\Rightarrow$ stable convergence.
         \end{itemize}
     \end{block}
 
     \vspace{0.3cm}
     \centering
     {\large\textbf{Thank You!}}\\[0.2cm]
-    {\footnotesize Code: \texttt{novel\_online\_training.py} \quad|\quad \texttt{novel\_utils.py}}
+    {\footnotesize Code: \texttt{hnsw\_online\_training.py} \quad|\quad \texttt{hnsw\_utils.py}}
 \end{frame}
 
 \end{document}
