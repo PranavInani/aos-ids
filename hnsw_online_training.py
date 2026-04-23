@@ -1,9 +1,16 @@
 """
-Novel AOC-IDS Online Training with two improvements:
-1. Confidence-aware pseudo-labeling (replaces random label flipping)
-2. Dynamic temperature scheduling (cosine annealing for CRC loss)
+AOC-IDS with HNSW-based Anomaly Detection.
 
-Uses the original proven 2-Gaussian decision boundary (not GMM).
+Novel contributions:
+1. HNSW vector search replaces Gaussian MLE decision boundary
+   — captures complex, non-linear clusters of normal behaviour
+   — operates in full embedding space (no lossy 1D projection)
+   — O(log N) query time via approximate nearest neighbour search
+2. Confidence-aware pseudo-labeling (from novel version)
+3. Dynamic temperature scheduling via cosine annealing (from novel version)
+
+The autoencoder architecture, CRC loss, and online training loop remain
+unchanged — only the detection/classification boundary is replaced.
 """
 import torch
 import numpy as np
@@ -11,7 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
 from sklearn.model_selection import train_test_split
-from novel_utils import *
+from hnsw_utils import evaluate_hnsw, HNSWAnomalyDetector
+from utils import AE, CRCLoss, SplitData, load_data, setup_seed, score_detail
 import argparse
 import warnings
 import math
@@ -19,26 +27,45 @@ import math
 warnings.filterwarnings('ignore')
 
 parser = argparse.ArgumentParser(
-    description='Novel AOC-IDS: confidence-aware pseudo-labels + dynamic temperature')
-# ---- Original arguments (same interface) ----
-parser.add_argument("--dataset", type=str, default='nsl')
-parser.add_argument("--epochs", type=int, default=4)
-parser.add_argument("--epoch_1", type=int, default=1)
-parser.add_argument("--percent", type=float, default=0.8)
-parser.add_argument("--flip_percent", type=float, default=0.2,
-                    help="(Legacy) Not used; kept for CLI compatibility")
-parser.add_argument("--sample_interval", type=int, default=2000)
-parser.add_argument("--cuda", type=str, default="0")
+    description='AOC-IDS with HNSW vector search anomaly detection')
 
-# ---- Novel arguments ----
+# ---- Original arguments (same interface) ----
+parser.add_argument("--dataset", type=str, default='nsl',
+                    choices=['nsl', 'unsw'],
+                    help="Dataset to use: 'nsl' (NSL-KDD) or 'unsw' (UNSW-NB15)")
+parser.add_argument("--epochs", type=int, default=4,
+                    help="Number of initial training epochs")
+parser.add_argument("--epoch_1", type=int, default=1,
+                    help="Number of retraining epochs per online step")
+parser.add_argument("--percent", type=float, default=0.8,
+                    help="Fraction of training data held out for online simulation")
+parser.add_argument("--sample_interval", type=int, default=2000,
+                    help="Chunk size for online streaming")
+parser.add_argument("--cuda", type=str, default="0",
+                    help="CUDA device ID")
+
+# ---- Confidence & temperature arguments ----
 parser.add_argument("--confidence_threshold", type=float, default=0.1,
-                    help="Min normalized confidence [0-1] to include pseudo-labeled sample")
+                    help="Min normalised confidence [0-1] to include pseudo-labeled sample")
 parser.add_argument("--initial_temp", type=float, default=0.1,
                     help="Starting temperature for cosine-annealed CRC loss")
 parser.add_argument("--min_temp", type=float, default=0.02,
                     help="Final temperature after cosine annealing")
 parser.add_argument("--online_temp", type=float, default=0.05,
-                    help="Warmer temperature used during online phase")
+                    help="Temperature used during online phase")
+
+# ---- HNSW-specific arguments ----
+parser.add_argument("--hnsw_k", type=int, default=10,
+                    help="Number of nearest neighbours for HNSW anomaly detection")
+parser.add_argument("--hnsw_threshold_percentile", type=float, default=95.0,
+                    help="Percentile of normal k-NN distances used as decision boundary "
+                         "(e.g. 95 → top 5%% flagged)")
+parser.add_argument("--hnsw_ef_construction", type=int, default=200,
+                    help="HNSW construction-time search width (higher = more accurate index)")
+parser.add_argument("--hnsw_M", type=int, default=16,
+                    help="HNSW max bi-directional links per node per layer")
+parser.add_argument("--hnsw_ef_search", type=int, default=100,
+                    help="HNSW query-time search width (higher = more accurate queries)")
 
 args = parser.parse_args()
 dataset = args.dataset
@@ -52,6 +79,13 @@ initial_temp = args.initial_temp
 min_temp = args.min_temp
 online_temp = args.online_temp
 
+# HNSW params
+hnsw_k = args.hnsw_k
+hnsw_threshold_pct = args.hnsw_threshold_percentile
+hnsw_ef_construction = args.hnsw_ef_construction
+hnsw_M = args.hnsw_M
+hnsw_ef_search = args.hnsw_ef_search
+
 bs = 128
 seed = 5009
 seed_round = 1
@@ -61,7 +95,7 @@ if dataset == 'nsl':
 else:
     input_dim = 196
 
-# ---- Load data (identical to original) ----
+# ── Load data ──
 if dataset == 'nsl':
     KDDTrain = load_data("NSL_pre_data/PKDDTrain+.csv")
     KDDTest = load_data("NSL_pre_data/PKDDTest+.csv")
@@ -86,12 +120,16 @@ def get_cosine_temp(epoch, total_epochs, t_max, t_min):
     return t_min + 0.5 * (t_max - t_min) * (1 + math.cos(math.pi * epoch / total_epochs))
 
 
-# ---- Main training loop (per seed) ----
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main training loop
+# ═══════════════════════════════════════════════════════════════════════════
 for i in range(seed_round):
     setup_seed(seed + i)
-    print(f"\n{'='*60}")
-    print(f"  Seed round {i+1}/{seed_round}  (seed={seed+i})")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print(f"  HNSW AOC-IDS  |  Seed {seed+i}  |  Dataset: {dataset.upper()}")
+    print(f"  HNSW params: k={hnsw_k}  percentile={hnsw_threshold_pct}  "
+          f"M={hnsw_M}  ef_c={hnsw_ef_construction}  ef_s={hnsw_ef_search}")
+    print(f"{'='*65}")
 
     online_x_train, online_x_test, online_y_train, online_y_test = \
         train_test_split(x_train, y_train, test_size=percent, random_state=seed + i)
@@ -102,13 +140,11 @@ for i in range(seed_round):
     model = AE(input_dim).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
-    # [NOVEL] Initialize CRC loss with higher starting temperature
     criterion = CRCLoss(device, initial_temp)
 
     # ==================== Phase 1: Initial training ====================
     model.train()
     for epoch in range(epochs):
-        # [NOVEL] Cosine anneal temperature: initial_temp -> min_temp
         current_temp = get_cosine_temp(epoch, epochs, initial_temp, min_temp)
         criterion.temperature = current_temp
 
@@ -125,16 +161,15 @@ for i in range(seed_round):
             optimizer.step()
 
     # ==================== Phase 2: Online training ====================
-    # [NOVEL] Switch to warmer temperature for online phase
     criterion.temperature = online_temp
     print(f'\n  [Phase 2] Online training  temp={online_temp}')
+    print(f'  [HNSW] Detection via k={hnsw_k} nearest-neighbour search '
+          f'(threshold @ {hnsw_threshold_pct}th percentile)')
 
     x_train = x_train.to(device)
     x_test = x_test.to(device)
     online_x_train, online_y_train = online_x_train.to(device), online_y_train.to(device)
 
-    # x_train_this_epoch and y_train_detection always grow together (for evaluate)
-    # y_train_this_epoch also grows in parallel (for model training, with confident labels only in new portions)
     x_train_this_epoch = online_x_train.clone()
     x_test_left_epoch = online_x_test.clone().to(device)
     y_train_this_epoch = online_y_train.clone()
@@ -156,18 +191,15 @@ for i in range(seed_round):
             x_test_this_epoch = x_test_left_epoch[:sample_interval].clone()
             x_test_left_epoch = x_test_left_epoch[sample_interval:]
 
-        # Compute normal templates
-        normal_mask = (online_y_train == 0).squeeze()
-        normal_temp = torch.mean(
-            F.normalize(model(online_x_train[normal_mask])[0], p=2, dim=1), dim=0)
-        normal_recon_temp = torch.mean(
-            F.normalize(model(online_x_train[normal_mask])[1], p=2, dim=1), dim=0)
-
-        # [NOVEL] Get predictions WITH confidence from proven 2-Gaussian method
-        predict_label, confidence = evaluate_with_confidence(
-            normal_temp, normal_recon_temp,
+        # [HNSW] Get predictions with confidence via HNSW vector search
+        predict_label, confidence = evaluate_hnsw(
             x_train_this_epoch, y_train_detection,
-            x_test_this_epoch, 0, model)
+            x_test_this_epoch, 0, model,
+            k=hnsw_k,
+            threshold_percentile=hnsw_threshold_pct,
+            ef_construction=hnsw_ef_construction,
+            M=hnsw_M,
+            ef_search=hnsw_ef_search)
 
         y_test_pred_this_epoch = predict_label
 
@@ -176,17 +208,16 @@ for i in range(seed_round):
             y_train_detection.to(device),
             torch.tensor(y_test_pred_this_epoch).to(device)))
 
-        # [NOVEL] Confidence-aware filtering: replace random flipping
+        # Confidence-aware filtering: replace random flipping
         confident_mask = confidence >= confidence_threshold
         n_confident = int(confident_mask.sum())
         n_total = len(y_test_pred_this_epoch)
         total_added += n_confident
         total_filtered += (n_total - n_confident)
 
-        # For training: use confident predictions as-is, set uncertain ones to 0 (normal)
-        # This is safer than random flipping — uncertain samples default to normal
+        # For training: confident predictions as-is, uncertain → normal (safe default)
         y_for_training = y_test_pred_this_epoch.copy()
-        y_for_training[~confident_mask] = 0  # uncertain → treat as normal (safe default)
+        y_for_training[~confident_mask] = 0
 
         x_train_this_epoch = torch.cat((
             x_train_this_epoch.to(device), x_test_this_epoch.to(device)))
@@ -213,22 +244,24 @@ for i in range(seed_round):
                 loss.backward()
                 optimizer.step()
 
-    print(f'\n  [Summary] Total confident: {total_added}, Uncertain (defaulted to normal): {total_filtered} '
+    print(f'\n  [Summary] Total confident: {total_added}, '
+          f'Uncertain (defaulted to normal): {total_filtered} '
           f'({total_filtered/max(total_added+total_filtered,1)*100:.1f}%)')
 
     # ==================== Final evaluation ====================
-    normal_mask = (online_y_train == 0).squeeze()
-    normal_temp = torch.mean(
-        F.normalize(model(online_x_train[normal_mask])[0], p=2, dim=1), dim=0)
-    normal_recon_temp = torch.mean(
-        F.normalize(model(online_x_train[normal_mask])[1], p=2, dim=1), dim=0)
-
-    print(f'\n  [Final Evaluation]')
-    res_en, res_de, res_final, _ = evaluate_with_confidence(
-        normal_temp, normal_recon_temp,
+    print(f'\n  [Final Evaluation — HNSW-based]')
+    res_en, res_de, res_final, _ = evaluate_hnsw(
         x_train_this_epoch, y_train_detection,
-        x_test, y_test, model)
+        x_test, y_test, model,
+        k=hnsw_k,
+        threshold_percentile=hnsw_threshold_pct,
+        ef_construction=hnsw_ef_construction,
+        M=hnsw_M,
+        ef_search=hnsw_ef_search)
 
-    print(f'  Encoder  -> Acc={res_en[0]:.4f} Prec={res_en[1]:.4f} Rec={res_en[2]:.4f} F1={res_en[3]:.4f}')
-    print(f'  Decoder  -> Acc={res_de[0]:.4f} Prec={res_de[1]:.4f} Rec={res_de[2]:.4f} F1={res_de[3]:.4f}')
-    print(f'  Combined -> Acc={res_final[0]:.4f} Prec={res_final[1]:.4f} Rec={res_final[2]:.4f} F1={res_final[3]:.4f}')
+    print(f'  Encoder  -> Acc={res_en[0]:.4f} Prec={res_en[1]:.4f} '
+          f'Rec={res_en[2]:.4f} F1={res_en[3]:.4f}')
+    print(f'  Decoder  -> Acc={res_de[0]:.4f} Prec={res_de[1]:.4f} '
+          f'Rec={res_de[2]:.4f} F1={res_de[3]:.4f}')
+    print(f'  Combined -> Acc={res_final[0]:.4f} Prec={res_final[1]:.4f} '
+          f'Rec={res_final[2]:.4f} F1={res_final[3]:.4f}')
